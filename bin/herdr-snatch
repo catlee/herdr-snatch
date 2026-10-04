@@ -8,10 +8,12 @@ import os
 import re
 import shlex
 import shutil
+import string
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 SCROLLBACK_LINES = 10_000_000
@@ -146,6 +148,52 @@ def opener_target(opener, fields):
         sys.exit(f"herdr-snatch: opener {opener['name']!r} has no value for {error}")
 
 
+def pane_cwd(pane_id=None, herdr="herdr"):
+    cwd = os.environ.get("HERDR_ACTIVE_PANE_CWD")
+    if not cwd and pane_id:
+        pane = json.loads(subprocess.run(
+            [herdr, "pane", "get", pane_id], check=True, capture_output=True, text=True,
+        ).stdout)["result"]["pane"]
+        cwd = pane.get("foreground_cwd") or pane["cwd"]
+    return cwd or os.getcwd()
+
+
+def git_repo_url(cwd, remote=None):
+    def git(*args):
+        try:
+            return subprocess.run(
+                ["git", "-C", cwd, *args], check=True, capture_output=True, text=True,
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError) as error:
+            detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) else str(error)
+            sys.exit(f"herdr-snatch: cannot resolve Git repository: {detail}")
+
+    if remote is None:
+        remotes = git("remote").splitlines()
+        remote = next((name for name in ("upstream", "origin") if name in remotes), None)
+        if remote is None:
+            if len(remotes) != 1:
+                sys.exit("herdr-snatch: no unambiguous Git remote; set git_remote on the opener")
+            remote = remotes[0]
+    url = git("remote", "get-url", remote)
+    if "://" not in url:
+        match = re.fullmatch(r"(?:[^/@:]+@)?([^/:]+):(.+)", url)
+        if not match:
+            sys.exit(f"herdr-snatch: Git remote is not a web repository: {url}")
+        url = f"ssh://{match[1]}/{match[2]}"
+    parsed = urlsplit(url)
+    path = parsed.path.rstrip("/").removesuffix(".git")
+    if parsed.scheme not in ("http", "https", "ssh", "git") or not parsed.hostname or not path.strip("/"):
+        sys.exit(f"herdr-snatch: Git remote is not a web repository: {url}")
+    host = parsed.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    if parsed.scheme in ("http", "https") and parsed.port:
+        host += f":{parsed.port}"
+    scheme = parsed.scheme if parsed.scheme in ("http", "https") else "https"
+    return f"{scheme}://{host}{path}"
+
+
 def choose_opener(value, matches):
     """Open directly when one opener outranks the rest; otherwise ask."""
     if len(matches) == 1 or matches[0][0].get("priority", 0) > matches[1][0].get("priority", 0):
@@ -171,6 +219,15 @@ def open_selection(value, pane_id, herdr):
     if not matches:
         open_target(value, pane_id, herdr)
         return
+    if len(matches) > 1 and matches[0][0].get("priority", 0) > matches[1][0].get("priority", 0):
+        matches = matches[:1]
+    for opener, fields in matches:
+        templates = [opener["url"]] if "url" in opener else opener["command"]
+        if "git_repo_url" not in fields and any(
+            field == "git_repo_url" for template in templates
+            for _, field, _, _ in string.Formatter().parse(template)
+        ):
+            fields["git_repo_url"] = git_repo_url(pane_cwd(pane_id, herdr), opener.get("git_remote"))
     chosen = choose_opener(value, matches)
     if not chosen:
         return
@@ -200,13 +257,7 @@ def open_target(value, pane_id=None, herdr="herdr"):
     else:
         path = Path(value).expanduser()
         if not path.is_absolute():
-            cwd = os.environ.get("HERDR_ACTIVE_PANE_CWD")
-            if not cwd and pane_id:
-                pane = json.loads(subprocess.run(
-                    [herdr, "pane", "get", pane_id], check=True, capture_output=True, text=True,
-                ).stdout)["result"]["pane"]
-                cwd = pane.get("foreground_cwd") or pane["cwd"]
-            path = Path(cwd or os.getcwd()) / path
+            path = Path(pane_cwd(pane_id, herdr)) / path
         if not path.exists():
             sys.exit(f"herdr-snatch: file does not exist: {value}")
         target = str(path.resolve())

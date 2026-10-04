@@ -80,7 +80,9 @@ Insert sends the selected text literally to the original pane. It doesn't press 
 
 ## Openers
 
-`Ctrl-O` checks the selection against a list of openers before falling back to URLs and paths. Out of the box, `owner/repo#123` opens on GitHub. Add your own under `"openers"` in `settings.json`:
+`Ctrl-O` checks the selection against a list of openers before falling back to URLs and paths. Out of the box, `owner/repo#123` opens on GitHub.
+
+Run `herdr plugin config-dir herdr-snatch` to find the plugin's config directory. Create or edit `settings.json` there (normally `~/.config/herdr/plugins/config/herdr-snatch/settings.json`), and add your own under `"openers"`. Keep any existing `scope` and `source` settings in the same file. Changes take effect the next time you open the picker.
 
 ```json
 {"openers": [
@@ -97,6 +99,23 @@ Insert sends the selected text literally to the original pane. It doesn't press 
 - An opener with the same `name` as a built-in replaces it.
 
 A word followed by a number, like `PR #123` or `task 42`, becomes a picker candidate when some opener matches it. Bare numbers are always candidates.
+
+### Open PRs in the current repository
+
+Use `{git_repo_url}` to open a PR number against the Git repository in the originating pane's working directory:
+
+```json
+{"openers": [
+  {"name": "GitHub PR", "match": "(?:PR\\s+#?|#?)(?P<number>\\d+)",
+   "url": "{git_repo_url}/pull/{number}"}
+]}
+```
+
+This matches `PR #123`, `#123`, and `123`. The plugin prefers the `upstream` remote, then `origin`, then the only remaining remote. Set `"git_remote": "origin"` on the opener to choose a remote explicitly.
+
+HTTPS and SSH remotes become browser URLs with the trailing `.git` removed. For example, `git@github.com:owner/repo.git` becomes `https://github.com/owner/repo`. Subdirectories and Git worktrees work too. The field is available in both `url` and `command` templates, and Git is queried only when the opener needs it. Missing repositories, ambiguous remotes, and local filesystem remotes produce an error when opening.
+
+The URL suffix is up to the opener; `/pull/{number}` is for GitHub. Tab and workspace searches still use the originating pane's repository, even when the selected text came from another pane.
 
 ## Development
 

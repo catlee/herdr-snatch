@@ -249,5 +249,95 @@ class OpenerTests(unittest.TestCase):
         self.assertEqual(snatch.matching_openers("a/b#1", snatch.load_openers()), [])
 
 
+class GitOpenerTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.cwd = self.directory.name
+        self.git("init", "--quiet")
+
+    def git(self, *args):
+        return subprocess.run(["git", "-C", self.cwd, *args], check=True, capture_output=True, text=True)
+
+    def test_remote_urls_are_normalized(self):
+        self.git("remote", "add", "origin", "https://github.com/owner/repo.git")
+        for remote, expected in (
+            ("https://github.com/owner/repo.git", "https://github.com/owner/repo"),
+            ("git@github.com:owner/repo.git", "https://github.com/owner/repo"),
+            ("ssh://git@code.example:2222/group/repo.git", "https://code.example/group/repo"),
+            ("https://code.example:8443/group/repo.git/", "https://code.example:8443/group/repo"),
+        ):
+            with self.subTest(remote=remote):
+                self.git("remote", "set-url", "origin", remote)
+                self.assertEqual(snatch.git_repo_url(self.cwd), expected)
+
+    def test_upstream_is_preferred_and_explicit_remote_wins(self):
+        self.git("remote", "add", "origin", "git@github.com:me/fork.git")
+        self.git("remote", "add", "upstream", "https://github.com/team/repo.git")
+        self.assertEqual(snatch.git_repo_url(self.cwd), "https://github.com/team/repo")
+        self.assertEqual(snatch.git_repo_url(self.cwd, "origin"), "https://github.com/me/fork")
+
+    def test_only_remote_is_used_from_subdirectories_and_worktrees(self):
+        self.git("remote", "add", "personal", "git@github.com:me/repo.git")
+        nested = pathlib.Path(self.cwd) / "src"
+        nested.mkdir()
+        self.assertEqual(snatch.git_repo_url(str(nested)), "https://github.com/me/repo")
+        self.git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial")
+        worktree = pathlib.Path(self.cwd) / "worktree"
+        self.git("worktree", "add", "--detach", str(worktree))
+        self.assertEqual(snatch.git_repo_url(str(worktree)), "https://github.com/me/repo")
+
+    def test_missing_ambiguous_and_local_remotes_fail_clearly(self):
+        with self.assertRaisesRegex(SystemExit, "no unambiguous Git remote"):
+            snatch.git_repo_url(self.cwd)
+        self.git("remote", "add", "first", "https://github.com/a/repo.git")
+        self.git("remote", "add", "second", "https://github.com/b/repo.git")
+        with self.assertRaisesRegex(SystemExit, "set git_remote"):
+            snatch.git_repo_url(self.cwd)
+        with self.assertRaisesRegex(SystemExit, "cannot resolve Git repository"):
+            snatch.git_repo_url(self.cwd, "missing")
+        self.git("remote", "add", "local", "/tmp/repo.git")
+        with self.assertRaisesRegex(SystemExit, "not a web repository"):
+            snatch.git_repo_url(self.cwd, "local")
+
+    def test_outside_repo_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(SystemExit, "cannot resolve Git repository"):
+                snatch.git_repo_url(directory)
+
+    def test_open_selection_uses_pane_repo_for_urls_and_commands(self):
+        self.git("remote", "add", "origin", "git@github.com:me/fork.git")
+        self.git("remote", "add", "upstream", "https://github.com/team/repo.git")
+        real_popen = subprocess.Popen
+        for target, expected in (
+            ({"url": "{git_repo_url}/pull/{number}"}, ["xdg-open", "https://github.com/me/fork/pull/123"]),
+            ({"command": ["open-pr", "{git_repo_url}", "{number}"]}, ["open-pr", "https://github.com/me/fork", "123"]),
+        ):
+            with self.subTest(target=target):
+                opener = {"name": "PR", "pattern": snatch.re.compile(r"(?:PR\s+#?|#?)(?P<number>\d+)"),
+                          "git_remote": "origin", **target}
+                with patch.dict("os.environ", {"HERDR_ACTIVE_PANE_CWD": self.cwd}), \
+                     patch.object(snatch, "load_openers", return_value=[opener]), \
+                     patch.object(snatch.shutil, "which", return_value="/usr/bin/xdg-open"), \
+                     patch.object(snatch.sys, "platform", "linux"), \
+                     patch.object(snatch.subprocess, "Popen", side_effect=lambda command, **kwargs:
+                                  real_popen(command, **kwargs) if command[0] == "git" else None) as popen:
+                    snatch.open_selection("PR #123", "w2:p3", "herdr")
+                self.assertEqual(popen.call_args.args[0], expected)
+
+    def test_lower_priority_git_opener_does_not_resolve_repo(self):
+        openers = [
+            {"name": "Ticket", "pattern": snatch.re.compile(r"(?P<number>\d+)"),
+             "priority": 100, "url": "https://tickets.example/{number}"},
+            {"name": "PR", "pattern": snatch.re.compile(r"(?P<number>\d+)"),
+             "url": "{git_repo_url}/pull/{number}"},
+        ]
+        with patch.object(snatch, "load_openers", return_value=openers), \
+             patch.object(snatch, "git_repo_url") as resolve, patch.object(snatch, "launch") as launch:
+            snatch.open_selection("123", "w2:p3", "herdr")
+        resolve.assert_not_called()
+        launch.assert_called_once_with("https://tickets.example/123")
+
+
 if __name__ == "__main__":
     unittest.main()
